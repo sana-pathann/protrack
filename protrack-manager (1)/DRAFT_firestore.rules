@@ -1,0 +1,122 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --- GLOBAL HELPERS ---
+    
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isSignedIn() && (request.auth.token.email_verified == true);
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function getGlobalRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isGlobalAdmin() {
+      return isSignedIn() && getGlobalRole() == "admin";
+    }
+
+    function isMemberOf(projectId) {
+      return isSignedIn() && exists(/databases/$(database)/documents/projects/$(projectId)/members/$(request.auth.uid));
+    }
+
+    function getProjectMemberRole(projectId) {
+      return get(/databases/$(database)/documents/projects/$(projectId)/members/$(request.auth.uid)).data.role;
+    }
+
+    function isProjectAdmin(projectId) {
+      return isMemberOf(projectId) && (getProjectMemberRole(projectId) in ["owner", "admin"]);
+    }
+
+    // --- SCHEMA VALIDATORS ---
+
+    function isValidUser(data) {
+      let requiredFields = ['email', 'displayName', 'role'];
+      return data.keys().hasAll(requiredFields) &&
+             data.keys().size() >= 3 &&
+             data.email is string && data.email.size() <= 256 &&
+             data.displayName is string && data.displayName.size() <= 128 &&
+             data.role in ['admin', 'member'];
+    }
+
+    function isValidProject(data) {
+      let requiredFields = ['name', 'ownerId', 'status'];
+      return data.keys().hasAll(requiredFields) &&
+             data.name is string && data.name.size() <= 256 &&
+             data.ownerId == request.auth.uid &&
+             data.status in ['active', 'archived'];
+    }
+
+    function isValidMembership(data) {
+      return data.userId is string && data.role in ['owner', 'admin', 'member'];
+    }
+
+    function isValidTask(data) {
+      let requiredFields = ['title', 'status', 'priority'];
+      return data.keys().hasAll(requiredFields) &&
+             data.title is string && data.title.size() <= 256 &&
+             data.status in ['todo', 'in_progress', 'review', 'completed'] &&
+             data.priority in ['low', 'medium', 'high'] &&
+             (!data.keys().contains('assigneeId') || data.assigneeId is string);
+    }
+
+    // --- MATCH BLOCKS ---
+
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Users
+    match /users/{userId} {
+      allow get: if isSignedIn() && isValidId(userId);
+      allow list: if isGlobalAdmin();
+      allow create: if isSignedIn() && userId == request.auth.uid && isValidId(userId) && isValidUser(incoming()) && incoming().role == "member";
+      allow update: if isGlobalAdmin() || (isSignedIn() && userId == request.auth.uid && isValidId(userId) && isValidUser(incoming()) && incoming().role == existing().role);
+    }
+
+    // Projects
+    match /projects/{projectId} {
+      allow get: if (isGlobalAdmin() || isMemberOf(projectId)) && isValidId(projectId);
+      allow list: if isGlobalAdmin() || (isSignedIn() && resource.data.ownerId == request.auth.uid);
+      allow create: if isSignedIn() && isValidId(projectId) && isValidProject(incoming());
+      allow update: if (isGlobalAdmin() || isProjectAdmin(projectId)) && isValidId(projectId) && isValidProject(incoming()) && incoming().ownerId == existing().ownerId;
+      allow delete: if (isGlobalAdmin() || (isProjectAdmin(projectId) && getProjectMemberRole(projectId) == "owner")) && isValidId(projectId);
+
+      // Members
+      match /members/{memberId} {
+        allow read: if (isGlobalAdmin() || isMemberOf(projectId)) && isValidId(memberId);
+        allow write: if (isGlobalAdmin() || (isProjectAdmin(projectId) && isValidMembership(incoming()))) && isValidId(memberId);
+      }
+
+      // Tasks
+      match /tasks/{taskId} {
+        allow read: if (isGlobalAdmin() || isMemberOf(projectId)) && isValidId(taskId);
+        allow create: if (isGlobalAdmin() || isMemberOf(projectId)) && isValidId(taskId) && isValidTask(incoming());
+        allow update: if (isGlobalAdmin() || (isMemberOf(projectId) && isValidId(taskId) && isValidTask(incoming()) && (
+          // Action: Update status
+          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']) ||
+          // Action: Full update (admins/owners)
+          (isProjectAdmin(projectId))
+        )));
+        allow delete: if (isGlobalAdmin() || isProjectAdmin(projectId)) && isValidId(taskId);
+      }
+    }
+  }
+}
